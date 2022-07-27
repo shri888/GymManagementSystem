@@ -1,0 +1,143 @@
+#Multi-configuration and multi-agent job options are not exported to YAML. Configure these options using documentation guidance: https://docs.microsoft.com/vsts/pipelines/process/phases
+
+pool:
+  name: Azure Pipelines
+#Your build pipeline references an undefined variable named ‘Get-Date -UFormat %s’. Create or edit the build pipeline for this YAML file, define the variable on the Variables tab. See https://go.microsoft.com/fwlink/?linkid=865972
+variables:
+  timestamp: 'none'
+
+steps:
+- task: SSH@0
+  displayName: 'Pre Deployment - Stop Server Process'
+  inputs:
+    sshEndpoint: 'Service Connection AppServer4'
+    runOptions: inline
+    inline: |
+     pkill -f "python3 app.py"
+     echo "Attempted Server Stop"
+     ps -ef | grep app.py
+     echo "#####################"
+    failOnStdErr: false
+    interactiveSession: true
+  continueOnError: true
+  condition: succeededOrFailed()
+
+- task: SSH@0
+  displayName: 'Deployment of App with Updates'
+  inputs:
+    sshEndpoint: 'Service Connection AppServer4'
+    runOptions: inline
+    inline: |
+     cd "/home/azureuser/GymManagementSystem/"
+     sleep 5
+     git pull origin
+     echo "Attempted Git Pull"
+    failOnStdErr: false
+    interactiveSession: true
+  continueOnError: true
+  condition: succeededOrFailed()
+
+- task: SSH@0
+  displayName: 'Post Deployment - Start Server Process'
+  inputs:
+    sshEndpoint: 'Service Connection AppServer4'
+    runOptions: inline
+    inline: |
+     cd "/home/azureuser/GymManagementSystem/"
+     sleep 5
+     nohup python3 app.py &
+     echo "Attempted Server Start"
+     ps -ef | grep app.py
+     echo "#####################"
+    failOnStdErr: false
+    interactiveSession: true
+  continueOnError: true
+
+- powershell: |
+   # Write your PowerShell commands here.
+   Write-Host "Fetching Sys DateTime..."
+   $timestamp=$(Get-Date -UFormat %s) -as [int];
+   Write-Host "##vso[task.setvariable variable=timestamp]$timestamp"
+   
+  displayName: 'Get Timestamp'
+
+- task: SSH@0
+  displayName: 'Setup Reports Folder'
+  inputs:
+    sshEndpoint: 'Service connection for lighthousecicdvm'
+    runOptions: inline
+    inline: |
+     mkdir -p ~/reports/$(timestamp)/{client/{member,admin},security,load}
+     sleep 5
+     sudo chmod -R o+w  ~/reports/$(timestamp)
+     sleep 10
+    failOnStdErr: false
+    interactiveSession: true
+  continueOnError: true
+  condition: succeededOrFailed()
+
+- task: SSH@0
+  displayName: 'Client Side Flow'
+  inputs:
+    sshEndpoint: 'Service connection for lighthousecicdvm'
+    runOptions: inline
+    inline: |
+     cd lighthouse
+     sleep 5
+     sudo docker run  --rm --name perf -it -v /home/azureuser/reports/$(timestamp)/client/member:/home/chrome/reports -v /home/azureuser/lighthouse/testcases:/home/chrome/testcases --security-opt seccomp=$HOME/chrome.json femtopixel/google-lighthouse-puppeteer memberDashboard -w --disable-storage-reset
+     sleep 30
+     python3 LighthouseToInflux.py  ../reports/$(timestamp)/client/member/51_13_37_41_5000_memberDash_memberClientSide.report.json memberDash$(timestamp)
+     sleep 5
+     sudo docker run --rm --name perf -it -v /home/azureuser/reports/$(timestamp)/client/admin/:/home/chrome/reports -v /home/azureuser/lighthouse/testcases:/home/chrome/testcases --security-opt seccomp=$HOME/chrome.json femtopixel/google-lighthouse-puppeteer adminDashboard -w --disable-storage-reset
+     sleep 30
+     python3 LighthouseToInflux.py  ../reports/$(timestamp)/client/admin/51_13_37_41_5000_adminDash.report.json adminDash$(timestamp)
+     sleep 5
+    failOnStdErr: false
+    interactiveSession: true
+  continueOnError: true
+  condition: succeededOrFailed()
+
+- task: SSH@0
+  displayName: 'JMeter Scenario Execution & Report Creation'
+  inputs:
+    sshEndpoint: 'Service connection for lighthousecicdvm'
+    runOptions: inline
+    inline: |
+     cd "/home/azureuser/jmeter/apache-jmeter-5.5/bin/"
+     sleep 5
+     sh jmeter -n -t "/home/azureuser/jmeter/jmeterscripts/nftflow1/LoadTestScenario_v1.jmx" -l "/home/azureuser/reports/$(timestamp)/load/jmetertestlog.jtl" -e -o "/home/azureuser/reports/$(timestamp)/load/"
+     sleep 10
+    failOnStdErr: false
+    interactiveSession: true
+  continueOnError: true
+  condition: succeededOrFailed()
+
+- task: SSH@0
+  displayName: 'Security Testing Flow'
+  inputs:
+    sshEndpoint: 'Service connection for lighthousecicdvm'
+    commands: 'sudo docker run -v ~/reports/$(timestamp)/security/:/zap/wrk/ -t owasp/zap2docker-stable zap-baseline.py -t http://51.13.37.41:5000 -r securitytestreport.html'
+    failOnStdErr: false
+    interactiveSession: true
+  continueOnError: true
+  condition: succeededOrFailed()
+
+- task: SSH@0
+  displayName: 'Send Mail To Recipients'
+  inputs:
+    sshEndpoint: 'Service connection for lighthousecicdvm'
+    runOptions: inline
+    inline: |
+     cd ~/reports/
+     sleep 5
+     zip -r $(timestamp).zip $(timestamp)
+     sleep 5
+     cd $HOME
+     sleep 5
+     python3 send_mail.py mayankkholia@outlook.com "Deployment_Report_$(timestamp)" "/home/azureuser/reports/$(timestamp)"
+     sleep 5
+    failOnStdErr: false
+    interactiveSession: true
+  continueOnError: true
+  condition: succeededOrFailed()
+
